@@ -1,0 +1,318 @@
+import os
+import io
+import time
+import tempfile
+from pathlib import Path
+from TTS.api import TTS
+
+
+import streamlit as st
+from audio_recorder_streamlit import audio_recorder
+from pydub import AudioSegment
+import requests
+
+# ----- Embeddings + Vector DB (FAISS) -----
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+# ----- LLM (Groq) -----
+from groq import Groq
+from dotenv import load_dotenv
+import os
+
+# Load .env file
+load_dotenv()
+
+# Get API key
+api_key = os.getenv("ASSEMBLYAI_API_KEY")
+
+if not api_key:
+    raise RuntimeError("ASSEMBLYAI_API_KEY not set in .env file")
+
+
+# ----- TTS (choose one) -----
+USE_COQUI = True
+if USE_COQUI:
+    from TTS.api import TTS
+else:
+    from gtts import gTTS
+
+# ----- Document loaders -----
+import docx2txt
+from pypdf import PdfReader
+
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def load_text_from_filelike(filename: str, data: bytes) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".pdf":
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            text = []
+            reader = PdfReader(tmp.name)
+            for page in reader.pages:
+                text.append(page.extract_text() or "")
+            return "\n".join(text)
+    elif suffix == ".docx":
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            return docx2txt.process(tmp.name) or ""
+    elif suffix in (".txt", ".md"):
+        return data.decode("utf-8", errors="ignore")
+    else:
+        return ""
+
+
+def chunk_text(text: str, size=800, overlap=120):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        chunk = text[start:end]
+        if chunk.strip():
+            chunks.append(chunk.strip())
+        start += size - overlap
+    return chunks
+
+
+# ---------------------------
+# Index / Retrieval
+# ---------------------------
+class SimpleFAISS:
+    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+        self.embedder = SentenceTransformer(model_name)
+        self.texts = []
+        self.sources = []
+        self.index = None
+        self.dim = self.embedder.get_sentence_embedding_dimension()
+
+    def build(self, docs: list[tuple[str, str]]):
+        self.texts = [t for t, _ in docs]
+        self.sources = [s for _, s in docs]
+        X = self.embedder.encode(
+            self.texts, normalize_embeddings=True, convert_to_numpy=True
+        )
+        self.index = faiss.IndexFlatIP(self.dim)
+        self.index.add(X)
+
+    def search(self, query: str, k=5):
+        q = self.embedder.encode(
+            [query], normalize_embeddings=True, convert_to_numpy=True
+        )
+        D, I = self.index.search(q, k)
+        results = []
+        for idx, score in zip(I[0], D[0]):
+            if 0 <= idx < len(self.texts):
+                results.append(
+                    {
+                        "text": self.texts[idx],
+                        "source": self.sources[idx],
+                        "score": float(score),
+                    }
+                )
+        return results
+
+
+# ---------------------------
+# ASR: AssemblyAI
+# ---------------------------
+class AssemblyAI_ASR:
+    def __init__(self):
+        self.api_key = os.getenv("ASSEMBLYAI_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("ASSEMBLYAI_API_KEY not set")
+        self.base_url = "https://api.assemblyai.com/v2"
+        self.headers = {"authorization": self.api_key}
+
+    def upload(self, wav_bytes: bytes) -> str:
+        """Upload audio bytes to AssemblyAI and return a temporary URL."""
+        response = requests.post(
+            f"{self.base_url}/upload", headers=self.headers, data=wav_bytes
+        )
+        response.raise_for_status()
+        return response.json()["upload_url"]
+
+    def transcribe(self, wav_bytes: bytes) -> str:
+        audio_url = self.upload(wav_bytes)
+        data = {"audio_url": audio_url}
+        response = requests.post(
+            f"{self.base_url}/transcript", json=data, headers=self.headers
+        )
+        response.raise_for_status()
+        transcript_id = response.json()["id"]
+        polling_endpoint = f"{self.base_url}/transcript/{transcript_id}"
+
+        # Poll until complete
+        while True:
+            result = requests.get(polling_endpoint, headers=self.headers).json()
+            if result["status"] == "completed":
+                return result["text"]
+            elif result["status"] == "error":
+                raise RuntimeError(f"Transcription failed: {result['error']}")
+            time.sleep(3)
+
+
+# ---------------------------
+# LLM (Groq) - RAG generator
+# ---------------------------
+class RAGGroq:
+    def __init__(self, model="llama3-70b-8192", temperature=0.2):
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY not set")
+        self.client = Groq(api_key=api_key)
+        self.model = model
+        self.temperature = temperature
+
+    def generate(self, query: str, contexts: list[dict]) -> str:
+        context_block = "\n\n".join(
+            [
+                f"[{i + 1}] {c['text']}\n(Source: {c['source']})"
+                for i, c in enumerate(contexts)
+            ]
+        )
+        prompt = f"""You are an assistant answering strictly from the provided context.
+If the answer isn't in the context, say you don't find it in the documents.
+
+Question:
+{query}
+
+Context:
+{context_block}
+
+Answer (concise, factual):"""
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            temperature=self.temperature,
+            messages=[
+                {"role": "system", "content": "You are a helpful RAG assistant."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+
+
+# ---------------------------
+# TTS
+# ---------------------------
+class TTSWrapper:
+    def __init__(self):
+        if USE_COQUI:
+            self.tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC")
+        else:
+            self.tts = None
+
+    def synth(self, text: str) -> bytes:
+        if USE_COQUI:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                self.tts.tts_to_file(text=text, file_path=tmp.name)
+                return Path(tmp.name).read_bytes()
+        else:
+            t = gTTS(text=text, lang="en")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+                t.save(tmp.name)
+                mp3 = AudioSegment.from_file(tmp.name, format="mp3")
+            wav_bytes = io.BytesIO()
+            mp3.export(wav_bytes, format="wav")
+            return wav_bytes.getvalue()
+
+
+# ---------------------------
+# Streamlit UI
+# ---------------------------
+st.set_page_config(
+    page_title="Speech-to-Speech Doc Assistant", page_icon="🗣️", layout="centered"
+)
+st.title("🗣️ Speech-to-Speech Document Assistant")
+st.caption("Speak a question about your uploaded documents; get a spoken answer.")
+
+with st.sidebar:
+    st.header("📄 Upload & Index")
+    files = st.file_uploader(
+        "Upload PDF/DOCX/TXT",
+        type=["pdf", "docx", "txt", "md"],
+        accept_multiple_files=True,
+    )
+    build_btn = st.button("Build / Rebuild Index")
+    st.divider()
+    st.header("⚙️ Settings")
+    top_k = st.slider("Retriever top_k", 1, 10, 5)
+    llm_model = st.selectbox(
+        "Groq LLM", ["llama3-70b-8192", "mixtral-8x7b-32768"], index=0
+    )
+
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
+
+if build_btn:
+    if not files:
+        st.warning("Upload at least one document.")
+    else:
+        docs = []
+        for f in files:
+            raw = f.read()
+            text = load_text_from_filelike(f.name, raw)
+            if not text.strip():
+                continue
+            chunks = chunk_text(text, size=800, overlap=120)
+            for ch in chunks:
+                docs.append((ch, f.name))
+        if not docs:
+            st.error("No text extracted. Are the PDFs scanned?")
+        else:
+            retr = SimpleFAISS()
+            retr.build(docs)
+            st.session_state.retriever = retr
+            st.success(f"Indexed {len(retr.texts)} chunks from {len(files)} file(s).")
+
+st.divider()
+st.subheader("🎤 Ask by voice")
+
+asr = AssemblyAI_ASR()
+tts = TTSWrapper()
+generator = None
+if st.session_state.retriever:
+    try:
+        generator = RAGGroq(model=llm_model, temperature=0.2)
+    except Exception as e:
+        st.error(f"Groq init error: {e}")
+
+audio_bytes = audio_recorder(
+    text="Click to record / stop", pause_threshold=2.0, sample_rate=16000
+)
+if audio_bytes:
+    st.audio(audio_bytes, format="audio/wav")
+    with st.spinner("Transcribing (AssemblyAI)..."):
+        query_text = asr.transcribe(audio_bytes)
+    st.write(f"🗒️ *Heard:* `{query_text}`")
+
+    if not query_text.strip():
+        st.error("Didn't catch that. Try again.")
+    elif not st.session_state.retriever:
+        st.warning("Build the index first from the sidebar.")
+    elif not generator:
+        st.warning("LLM not ready. Check GROQ_API_KEY and try again.")
+    else:
+        with st.spinner("Retrieving..."):
+            ctx = st.session_state.retriever.search(query_text, k=top_k)
+        with st.expander("🔎 Retrieved context"):
+            for i, c in enumerate(ctx, 1):
+                st.markdown(
+                    f"**{i}. {c['source']}** (score={c['score']:.3f})\n\n{c['text'][:600]}{'...' if len(c['text']) > 600 else ''}"
+                )
+
+        with st.spinner("Generating answer..."):
+            answer = generator.generate(query_text, ctx)
+
+        with st.spinner("Synthesizing speech..."):
+            out_wav = tts.synth(answer)
+
+        st.markdown("### ▶️ Answer (audio)")
+        st.audio(out_wav, format="audio/wav")
+        with st.expander("📝 (Dev view) Text answer"):
+            st.write(answer)

@@ -1,0 +1,12 @@
+streamlit
+audio-recorder-streamlit
+pydub
+soundfile
+faster-whisper
+sentence-transformers
+faiss-cpu
+groq
+pypdf
+docx2txt
+gradio_client
+requests
