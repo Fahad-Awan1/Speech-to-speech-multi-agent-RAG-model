@@ -3,44 +3,46 @@ import io
 import time
 import tempfile
 from pathlib import Path
-from TTS.api import TTS
-
 
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
 from pydub import AudioSegment
 import requests
-
-# ----- Embeddings + Vector DB (FAISS) -----
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
-
-# ----- LLM (Groq) -----
 from groq import Groq
 from dotenv import load_dotenv
-import os
+import docx2txt
+from pypdf import PdfReader
 
-# Load .env file
-load_dotenv()
-
-# Get API key
-api_key = os.getenv("ASSEMBLYAI_API_KEY")
-
-if not api_key:
-    raise RuntimeError("ASSEMBLYAI_API_KEY not set in .env file")
+# ---------------------------
+# Load API Keys (env + secrets fallback)
+# ---------------------------
+load_dotenv()  # loads local .env if exists
 
 
-# ----- TTS (choose one) -----
+def get_secret(key: str) -> str:
+    """Try .env first, then Streamlit secrets"""
+    return os.getenv(key) or st.secrets.get(key)
+
+
+ASSEMBLYAI_API_KEY = get_secret("ASSEMBLYAI_API_KEY")
+GROQ_API_KEY = get_secret("GROQ_API_KEY")
+
+if not ASSEMBLYAI_API_KEY:
+    raise RuntimeError("❌ ASSEMBLYAI_API_KEY not set (check .env or secrets.toml)")
+if not GROQ_API_KEY:
+    raise RuntimeError("❌ GROQ_API_KEY not set (check .env or secrets.toml)")
+
+# ---------------------------
+# TTS (choose one)
+# ---------------------------
 USE_COQUI = True
 if USE_COQUI:
     from TTS.api import TTS
 else:
     from gtts import gTTS
-
-# ----- Document loaders -----
-import docx2txt
-from pypdf import PdfReader
 
 
 # ---------------------------
@@ -123,14 +125,11 @@ class SimpleFAISS:
 # ---------------------------
 class AssemblyAI_ASR:
     def __init__(self):
-        self.api_key = os.getenv("ASSEMBLYAI_API_KEY")
-        if not self.api_key:
-            raise RuntimeError("ASSEMBLYAI_API_KEY not set")
+        self.api_key = ASSEMBLYAI_API_KEY
         self.base_url = "https://api.assemblyai.com/v2"
         self.headers = {"authorization": self.api_key}
 
     def upload(self, wav_bytes: bytes) -> str:
-        """Upload audio bytes to AssemblyAI and return a temporary URL."""
         response = requests.post(
             f"{self.base_url}/upload", headers=self.headers, data=wav_bytes
         )
@@ -147,7 +146,6 @@ class AssemblyAI_ASR:
         transcript_id = response.json()["id"]
         polling_endpoint = f"{self.base_url}/transcript/{transcript_id}"
 
-        # Poll until complete
         while True:
             result = requests.get(polling_endpoint, headers=self.headers).json()
             if result["status"] == "completed":
@@ -162,10 +160,7 @@ class AssemblyAI_ASR:
 # ---------------------------
 class RAGGroq:
     def __init__(self, model="llama3-70b-8192", temperature=0.2):
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            raise RuntimeError("GROQ_API_KEY not set")
-        self.client = Groq(api_key=api_key)
+        self.client = Groq(api_key=GROQ_API_KEY)
         self.model = model
         self.temperature = temperature
 
