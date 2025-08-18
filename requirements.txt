@@ -1,6 +1,5 @@
 streamlit
 audio-recorder-streamlit
-pydub
 requests
 faiss-cpu
 numpy

@@ -7,7 +7,6 @@ import logging
 
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
-from pydub import AudioSegment
 import requests
 import faiss
 import numpy as np
@@ -304,14 +303,15 @@ Answer:"""
             raise RuntimeError(f"Failed to generate answer from LLM: {e}")
 
 
+# --- THIS IS THE NEW, SIMPLIFIED CODE ---
 class TTSWrapper:
     """A wrapper for Text-to-Speech synthesis."""
 
     def __init__(self):
         self.tts_model = load_tts_model() if USE_COQUI_TTS else None
 
-    def synth(self, text: str) -> bytes:
-        """Synthesizes text into speech (WAV format)."""
+    def synth(self, text: str) -> tuple[bytes, str]:  # We will return the format too
+        """Synthesizes text into speech."""
         logging.info(f"Synthesizing speech for text: '{text[:50]}...'")
         if USE_COQUI_TTS:
             tmp_path = None
@@ -320,7 +320,7 @@ class TTSWrapper:
                     tmp_path = tmp.name
                 self.tts_model.tts_to_file(text=text, file_path=tmp_path)
                 with open(tmp_path, "rb") as f:
-                    return f.read()
+                    return f.read(), "audio/wav"  # Return WAV bytes and format
             finally:
                 if tmp_path and os.path.exists(tmp_path):
                     os.unlink(tmp_path)
@@ -330,13 +330,7 @@ class TTSWrapper:
                 mp3_fp = io.BytesIO()
                 tts_obj.write_to_fp(mp3_fp)
                 mp3_fp.seek(0)
-
-                # Convert MP3 (from gTTS) to WAV for consistent playback
-                mp3_audio = AudioSegment.from_file(mp3_fp, format="mp3")
-                wav_fp = io.BytesIO()
-                mp3_audio.export(wav_fp, format="wav")
-                wav_fp.seek(0)
-                return wav_fp.getvalue()
+                return mp3_fp.getvalue(), "audio/mp3"  # Return MP3 bytes and format
             except Exception as e:
                 logging.error(f"gTTS failed: {e}")
                 raise RuntimeError(f"Failed to synthesize speech: {e}")
@@ -470,11 +464,13 @@ def main():
             with st.spinner("3/4 - Generating the answer..."):
                 answer = generator.generate(query_text, contexts)
 
+            # --- THIS IS THE NEW CODE ---
             with st.spinner("4/4 - Synthesizing the spoken answer..."):
-                out_wav = tts.synth(answer)
+                # The synth function now returns the audio bytes AND the format
+                out_audio_bytes, audio_format = tts.synth(answer)
 
             st.markdown("### 🔊 Here is your answer:")
-            st.audio(out_wav, format="audio/wav")
+            st.audio(out_audio_bytes, format=audio_format)
             with st.expander("📝 View Text Answer"):
                 st.write(answer)
 
