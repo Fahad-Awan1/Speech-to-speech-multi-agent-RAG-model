@@ -365,16 +365,13 @@ def main():
 
         build_btn = st.button("Build Index")
 
-        st.divider()
-        st.header("2. Configure Settings")
-        top_k = st.slider("Number of context chunks to retrieve", 1, 10, 5, key="top_k")
-        llm_model = st.selectbox(
-            "Groq LLM Model",
-            ["llama3-70b-8192", "mixtral-8x7b-32768", "llama3-8b-8192"],
-            index=0,
-            key="llm_model",
-        )
-
+    st.slider("Number of context chunks to retrieve", 1, 10, 5, key="top_k")
+    st.selectbox(
+        "Groq LLM Model",
+        ["llama3-70b-8192", "mixtral-8x7b-32768", "llama3-8b-8192"],
+        index=0,
+        key="llm_model",
+    )
     # --- Session State Initialization ---
     if "retriever" not in st.session_state:
         st.session_state.retriever = None
