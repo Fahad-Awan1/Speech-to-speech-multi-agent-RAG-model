@@ -3,11 +3,14 @@ import io
 import time
 import tempfile
 from pathlib import Path
-import logging
+import hashlib
 
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
+from pydub import AudioSegment
 import requests
+
+# ----- Core Logic Imports -----
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -15,116 +18,97 @@ from groq import Groq
 from dotenv import load_dotenv
 import docx2txt
 from pypdf import PdfReader
+from pptx import Presentation
+from rank_bm25 import BM25Okapi
+
+# ----- TTS Imports -----
+USE_COQUI = True
+try:
+    from TTS.api import TTS
+except ImportError:
+    st.warning(
+        "Coqui TTS not found, falling back to gTTS. For better quality, run: pip install TTS"
+    )
+    USE_COQUI = False
 from gtts import gTTS
 
-# --- Configuration ---
-# This version is optimized for gTTS for stability and easy deployment.
-# The code for Coqui TTS has been removed for simplicity.
-
-# Set up basic logging to show information in the terminal
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-
 # ---------------------------
-# API Key Management
+# Load Environment & Page Config
 # ---------------------------
-# Load environment variables from a .env file if it exists
 load_dotenv()
 
+st.set_page_config(
+    page_title="AI Assistant",
+    page_icon="🚀",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-def get_secret(key: str) -> str:
-    """
-    Retrieves a secret key from environment variables or Streamlit's secrets manager.
-    Priority:
-    1. Environment variable (e.g., from a local .env file).
-    2. Streamlit secrets manager (for deployment).
-    """
-    secret_value = os.getenv(key)
-    if secret_value:
-        return secret_value
-
-    # Fallback to Streamlit secrets if not found in env
-    try:
-        # st.secrets is only available when the app is running on Streamlit,
-        # so we handle the case where it might not be available locally.
-        if hasattr(st, "secrets"):
-            return st.secrets.get(key)
-    except Exception:
-        return None
-    return None
-
-
-ASSEMBLYAI_API_KEY = get_secret("ASSEMBLYAI_API_KEY")
-GROQ_API_KEY = get_secret("GROQ_API_KEY")
-
-# Check for essential API keys and stop the app if they are not found
-if not ASSEMBLYAI_API_KEY:
+# --- Check for API Keys on Startup ---
+if not os.getenv("ASSEMBLYAI_API_KEY") or not os.getenv("GROQ_API_KEY"):
     st.error(
-        "❌ ASSEMBLYAI_API_KEY not found. Please set it in your .env file or Streamlit secrets."
-    )
-    st.stop()
-if not GROQ_API_KEY:
-    st.error(
-        "❌ GROQ_API_KEY not found. Please set it in your .env file or Streamlit secrets."
+        "🚨 API Key Error: Please ensure both ASSEMBLYAI_API_KEY and GROQ_API_KEY are set in your .env file."
     )
     st.stop()
 
+# ---------------------------
+# Caching for Performance
+# ---------------------------
 
-# ---------------------------
-# Caching for Expensive Models
-# ---------------------------
+
 @st.cache_resource
 def load_sentence_transformer_model(
     model_name="sentence-transformers/all-MiniLM-L6-v2",
 ):
-    """Loads and caches the SentenceTransformer model to avoid reloading on every run."""
-    logging.info(f"Loading SentenceTransformer model: {model_name}")
     return SentenceTransformer(model_name)
 
 
+@st.cache_resource
+def load_tts_model():
+    if USE_COQUI:
+        try:
+            return TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC")
+        except Exception as e:
+            st.error(f"Failed to load Coqui TTS model: {e}")
+            return None
+    return None
+
+
 # ---------------------------
-# Utility Functions
+# Enhanced Backend Functionality (Unchanged)
 # ---------------------------
+
+
 def load_text_from_filelike(filename: str, data: bytes) -> str:
-    """
-    Extracts text content from various file types (PDF, DOCX, TXT, MD).
-    Handles temporary file creation and cleanup securely.
-    """
+    # This function remains the same as the previous version
     suffix = Path(filename).suffix.lower()
     text = ""
-    tmp_path = None
     try:
-        if suffix in (".pdf", ".docx"):
-            # Create a temporary file to be read by libraries that need a file path
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        if suffix == ".pdf":
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(data)
-                tmp_path = tmp.name
-
-            if suffix == ".pdf":
-                reader = PdfReader(tmp_path)
+                tmp.flush()
+                reader = PdfReader(tmp.name)
                 text = "\n".join(page.extract_text() or "" for page in reader.pages)
-            elif suffix == ".docx":
-                text = docx2txt.process(tmp_path) or ""
+        elif suffix == ".docx":
+            with io.BytesIO(data) as docx_file:
+                text = docx2txt.process(docx_file) or ""
+        elif suffix == ".pptx":
+            with io.BytesIO(data) as pptx_file:
+                prs = Presentation(pptx_file)
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text"):
+                            text += shape.text + "\n"
         elif suffix in (".txt", ".md"):
             text = data.decode("utf-8", errors="ignore")
     except Exception as e:
-        st.error(f"Error processing file {filename}: {e}")
-        return ""
-    finally:
-        # Clean up the temporary file if it was created
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        st.error(f"Error processing {filename}: {e}")
     return text
 
 
-def chunk_text(text: str, size: int = 800, overlap: int = 120) -> list[str]:
-    """
-    Splits a long text into smaller, overlapping chunks.
-    """
-    if not text:
-        return []
+def chunk_text(text: str, size=1000, overlap=150):
+    # This function remains the same
     chunks = []
     start = 0
     while start < len(text):
@@ -136,320 +120,391 @@ def chunk_text(text: str, size: int = 800, overlap: int = 120) -> list[str]:
     return chunks
 
 
-# ---------------------------
-# Core Logic Classes
-# ---------------------------
-class SimpleFAISS:
-    """A simple wrapper for FAISS vector search."""
-
-    def __init__(self, embedder):
-        self.embedder = embedder
+class HybridRetriever:
+    # This class remains the same
+    def __init__(self, model):
+        self.embedder = model
         self.texts = []
         self.sources = []
-        self.index = None
+        self.faiss_index = None
+        self.bm25_index = None
         self.dim = self.embedder.get_sentence_embedding_dimension()
 
     def build(self, docs: list[tuple[str, str]]):
-        """Builds the FAISS index from a list of document chunks."""
         self.texts = [t for t, _ in docs]
         self.sources = [s for _, s in docs]
-
-        logging.info(f"Generating embeddings for {len(self.texts)} chunks...")
         embeddings = self.embedder.encode(
             self.texts, normalize_embeddings=True, convert_to_numpy=True
         )
+        self.faiss_index = faiss.IndexFlatIP(self.dim)
+        self.faiss_index.add(embeddings)
+        tokenized_corpus = [doc.lower().split() for doc in self.texts]
+        self.bm25_index = BM25Okapi(tokenized_corpus)
 
-        logging.info("Building FAISS index...")
-        self.index = faiss.IndexFlatIP(self.dim)
-        self.index.add(embeddings.astype(np.float32))
-        logging.info("FAISS index built successfully.")
-
-    def search(self, query: str, k: int = 5) -> list[dict]:
-        """Performs a similarity search on the FAISS index."""
-        if self.index is None:
-            raise RuntimeError(
-                "Index is not built. Please upload documents and build the index first."
-            )
-
+    def search(self, query: str, k=5):
+        if not self.texts:
+            return []
         query_embedding = self.embedder.encode(
             [query], normalize_embeddings=True, convert_to_numpy=True
         )
-
-        distances, indices = self.index.search(query_embedding.astype(np.float32), k)
-
-        results = []
-        for idx, score in zip(indices[0], distances[0]):
-            if 0 <= idx < len(self.texts):
-                results.append(
-                    {
-                        "text": self.texts[idx],
-                        "source": self.sources[idx],
-                        "score": float(score),
-                    }
-                )
-        return results
-
-
-class AssemblyAI_ASR:
-    """Handles Speech-to-Text using the AssemblyAI API."""
-
-    def __init__(self):
-        self.api_key = ASSEMBLYAI_API_KEY
-        self.base_url = "https://api.assemblyai.com/v2"
-        self.headers = {"authorization": self.api_key}
-
-    def _upload_audio(self, wav_bytes: bytes) -> str:
-        """Uploads audio data and returns the audio URL."""
-        upload_endpoint = f"{self.base_url}/upload"
-        response = requests.post(upload_endpoint, headers=self.headers, data=wav_bytes)
-        response.raise_for_status()
-        return response.json()["upload_url"]
-
-    def transcribe(self, wav_bytes: bytes) -> str:
-        """Transcribes audio by uploading and polling for results."""
-        logging.info("Uploading audio to AssemblyAI...")
-        audio_url = self._upload_audio(wav_bytes)
-
-        transcript_endpoint = f"{self.base_url}/transcript"
-        data = {"audio_url": audio_url}
-        response = requests.post(transcript_endpoint, json=data, headers=self.headers)
-        response.raise_for_status()
-        transcript_id = response.json()["id"]
-
-        polling_endpoint = f"{self.base_url}/transcript/{transcript_id}"
-        logging.info("Transcription started. Polling for results...")
-
-        while True:
-            result = requests.get(polling_endpoint, headers=self.headers).json()
-            if result["status"] == "completed":
-                logging.info("Transcription completed.")
-                return result["text"] or ""
-            elif result["status"] == "error":
-                logging.error(f"AssemblyAI transcription failed: {result['error']}")
-                raise RuntimeError(f"Transcription failed: {result['error']}")
-            time.sleep(3)
-
-
-class RAGGroq:
-    """Handles response generation using Groq and RAG."""
-
-    def __init__(self, model: str, temperature: float = 0.2):
-        self.client = Groq(api_key=GROQ_API_KEY)
-        self.model = model
-        self.temperature = temperature
-
-    def generate(self, query: str, contexts: list[dict]) -> str:
-        """Generates an answer based on the query and retrieved contexts."""
-        if not contexts:
-            return "I could not find any relevant information in the provided documents to answer your question."
-
-        context_block = "\n\n".join(
-            f"Context [{i + 1}] from source '{c['source']}':\n{c['text']}"
-            for i, c in enumerate(contexts)
+        faiss_scores, faiss_indices = self.faiss_index.search(query_embedding, k * 5)
+        tokenized_query = query.lower().split()
+        bm25_scores = self.bm25_index.get_scores(tokenized_query)
+        bm25_top_indices = np.argsort(bm25_scores)[::-1][: k * 5]
+        fused_scores = {}
+        rrf_k = 60
+        for rank, idx in enumerate(faiss_indices[0]):
+            fused_scores[idx] = fused_scores.get(idx, 0) + 1.0 / (rank + rrf_k)
+        for rank, idx in enumerate(bm25_top_indices):
+            fused_scores[idx] = fused_scores.get(idx, 0) + 1.0 / (rank + rrf_k)
+        sorted_indices = sorted(
+            fused_scores.keys(), key=lambda idx: fused_scores[idx], reverse=True
         )
+        return [
+            {"text": self.texts[idx], "source": self.sources[idx]}
+            for idx in sorted_indices[:k]
+        ]
 
-        prompt = f"""You are a helpful AI assistant. Your task is to answer the user's question based *only* on the provided context information.
-Follow these rules strictly:
-1. Base your answer entirely on the text provided in the 'Context' section.
-2. Do not use any external knowledge or information you have outside of the provided context.
-3. If the answer cannot be found within the provided context, state clearly: "I could not find the answer in the provided documents."
-4. Keep your answer concise and to the point.
 
----
-Context:
-{context_block}
----
+class Services:
+    # This class remains the same
+    def __init__(self, model_name):
+        self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        self.model_name = model_name
+        self.tts_model = load_tts_model()
 
-Question: {query}
-
-Answer:"""
-
-        logging.info("Generating answer with Groq LLM...")
+    def transcribe_audio(self, wav_bytes: bytes) -> str:
+        api_key = os.getenv("ASSEMBLYAI_API_KEY")
+        headers = {"authorization": api_key}
+        base_url = "https://api.assemblyai.com/v2"
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                temperature=self.temperature,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful RAG assistant that answers questions strictly based on the provided context.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
+            upload_response = requests.post(
+                f"{base_url}/upload", headers=headers, data=wav_bytes
             )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            logging.error(f"Groq API call failed: {e}")
-            raise RuntimeError(f"Failed to generate answer from LLM: {e}")
+            upload_response.raise_for_status()
+            audio_url = upload_response.json()["upload_url"]
+            transcript_response = requests.post(
+                f"{base_url}/transcript", json={"audio_url": audio_url}, headers=headers
+            )
+            transcript_response.raise_for_status()
+            transcript_id = transcript_response.json()["id"]
+            polling_endpoint = f"{base_url}/transcript/{transcript_id}"
+            while True:
+                result = requests.get(polling_endpoint, headers=headers).json()
+                if result["status"] == "completed":
+                    return result["text"] or ""
+                elif result["status"] == "error":
+                    raise RuntimeError(f"Transcription failed: {result['error']}")
+                time.sleep(2)
+        except requests.exceptions.RequestException as e:
+            st.error(f"AssemblyAI API Error: {e}")
+            return ""
 
-
-class TTSWrapper:
-    """A simplified wrapper for Text-to-Speech synthesis using gTTS."""
-
-    def synth(self, text: str) -> tuple[bytes, str]:
-        """
-        Synthesizes text into speech (MP3 format) using gTTS.
-        Returns a tuple of (audio_bytes, audio_format_string).
-        """
-        logging.info(f"Synthesizing speech with gTTS for text: '{text[:50]}...'")
+    def generate_streamed_response(
+        self, query: str, contexts: list[dict], chat_history: list
+    ):
+        context_block = "\n\n".join(
+            [f"Source: {c['source']}\nContent: {c['text']}" for c in contexts]
+        )
+        history_block = "\n".join(
+            [f"{msg['role']}: {msg['content']}" for msg in chat_history]
+        )
+        prompt = f"You are a helpful assistant. Answer the user's question based *only* on the provided context. If the answer is not in the context, state that you cannot find the information. \n\nPrevious Conversation:\n{history_block}\n\nProvided Context:\n{context_block}\n\nUser Question: {query}\n\nAnswer:"
         try:
-            tts_obj = gTTS(text=text, lang="en")
-            # Create an in-memory binary stream to save the MP3 file
-            mp3_fp = io.BytesIO()
-            tts_obj.write_to_fp(mp3_fp)
-            mp3_fp.seek(0)
-            # Return the MP3 bytes and the correct format string for st.audio
-            return mp3_fp.getvalue(), "audio/mp3"
+            stream = self.groq_client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                stream=True,
+            )
+            for chunk in stream:
+                yield chunk.choices[0].delta.content or ""
         except Exception as e:
-            logging.error(f"gTTS failed: {e}")
-            raise RuntimeError(f"Failed to synthesize speech: {e}")
+            st.error(f"Groq API Error: {e}")
+            yield ""
+
+    def synthesize_audio(self, text: str) -> bytes | None:
+        try:
+            if USE_COQUI and self.tts_model:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                    self.tts_model.tts_to_file(text=text, file_path=tmp.name)
+                    return Path(tmp.name).read_bytes()
+            else:
+                tts = gTTS(text=text, lang="en")
+                with io.BytesIO() as fp:
+                    tts.write_to_fp(fp)
+                    fp.seek(0)
+                    mp3_audio = AudioSegment.from_file(fp, format="mp3")
+                    wav_io = io.BytesIO()
+                    mp3_audio.export(wav_io, format="wav")
+                    return wav_io.getvalue()
+        except Exception as e:
+            st.error(f"Text-to-Speech Error: {e}")
+            return None
 
 
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-def main():
-    st.set_page_config(
-        page_title="Speech-to-Speech Doc Assistant", page_icon="🗣️", layout="centered"
+
+# --- NEW CSS FOR THE DARK THEME ---
+st.markdown(
+    """
+<style>
+    /* General App Styling */
+    .stApp { background-color: #0F1115; color: #E5E7EB; }
+    #MainMenu, footer, header { visibility: hidden; }
+    .block-container { padding: 1rem 2rem 2rem 2rem !important; }
+
+    /* Top Gradient Bar */
+    .top-gradient-bar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 4px;
+        background: linear-gradient(90deg, #ff4e50, #f9d423);
+        z-index: 999999;
+    }
+
+    /* Sidebar Styling */
+    [data-testid="stSidebar"] {
+        background-color: #1F2125;
+        padding: 1rem;
+    }
+    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2 {
+        color: #FFFFFF;
+        font-weight: 300;
+    }
+    [data-testid="stSidebar"] p {
+        color: #A0A0A0;
+    }
+    .stButton > button {
+        background-color: #30333A;
+        color: #FFFFFF;
+        border: 1px solid #4A4D55;
+        border-radius: 8px;
+        padding: 10px 14px;
+    }
+    .stButton > button:hover {
+        background-color: #3C3F44;
+        border-color: #5A5F69;
+    }
+    [data-testid="stSidebar"] .stButton > button {
+        background-color: #30333A;
+        color: #FFFFFF;
+        border: 1px solid #4A4D55;
+        border-radius: 8px;
+        padding: 10px 0;
+    }
+
+    /* Custom File Uploader */
+    [data-testid="stFileUploader"] {
+        background-color: #1E1F22;
+        border: 1px solid #3C3F44;
+        border-radius: 8px;
+        padding: 1.5rem;
+    }
+    [data-testid="stFileUploader"] > label {
+        color: #FFFFFF;
+        font-weight: 300;
+    }
+    [data-testid="stFileUploader"] small {
+        color: #A0A0A0;
+    }
+    [data-testid="stFileUploader"] button {
+        background-color: #3C3F44;
+        color: #FFFFFF;
+        border: 1px solid #555;
+    }
+    
+    /* Main Content Area */
+    .main-header {
+        color: #E0E0E0;
+        font-weight: 200;
+        font-size: 3rem;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+
+    /* Input Fields */
+    [data-testid="stTextInput"] > div > div > input, .st-emotion-cache-1ypb00x {
+        background-color: #25262A !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-radius: 8px !important;
+        padding: 15px !important;
+        box-shadow: none !important;
+    }
+
+    /* Chat Bubbles (Simple styling for when chat history appears) */
+    .user-bubble { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 1rem; border-radius: 10px 10px 0 10px; }
+    .assistant-bubble { background-color: #2B2D31; color: #E5E7EB; padding: 1rem; border-radius: 10px 10px 10px 0; border: 1px solid #3C3F44; }
+
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# Add the gradient bar to the top of the page
+st.markdown('<div class="top-gradient-bar"></div>', unsafe_allow_html=True)
+
+# --- Session State ---
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "processing" not in st.session_state:
+    st.session_state.processing = False
+
+# ---------------------------
+# Sidebar UI
+# ---------------------------
+with st.sidebar:
+    st.title("🚀 AI Assistant")
+    st.markdown("---")
+    st.header("1. Upload Documents")
+    st.caption("PDF, DOCX, PPTX, TXT")
+    files = st.file_uploader(
+        "Drag and drop files here",
+        type=["pdf", "docx", "pptx", "txt", "md"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
     )
-    st.title("🗣️ Speech-to-Speech Document Assistant")
-    st.caption(
-        "Speak a question about your uploaded documents and get a spoken answer back."
-    )
-
-    # --- Sidebar for controls ---
-    with st.sidebar:
-        st.header("1. Upload & Index Documents")
-        files = st.file_uploader(
-            "Upload PDF, DOCX, or TXT files",
-            type=["pdf", "docx", "txt", "md"],
-            accept_multiple_files=True,
-        )
-
-        build_btn = st.button("Build Index")
-
-        st.divider()
-        st.header("2. Configure Settings")
-        # Use st.session_state to access these values later
-        st.slider("Number of context chunks to retrieve", 1, 10, 5, key="top_k")
-        st.selectbox(
-            "Groq LLM Model",
-            ["llama3-70b-8192", "mixtral-8x7b-32768", "llama3-8b-8192"],
-            index=0,
-            key="llm_model",
-        )
-
-    # --- Session State Initialization ---
-    if "retriever" not in st.session_state:
-        st.session_state.retriever = None
-
-    # --- Index Building Logic ---
-    if build_btn:
+    if st.button("Build Knowledge Base", use_container_width=True):
         if not files:
-            st.warning("Please upload at least one document to build the index.")
+            st.warning("Please upload at least one document.")
         else:
-            with st.spinner(
-                "Processing documents and building index... This may take a moment."
-            ):
-                docs = []
-                for f in files:
-                    try:
-                        raw_bytes = f.read()
-                        text = load_text_from_filelike(f.name, raw_bytes)
-                        if not text or not text.strip():
-                            st.warning(f"No text extracted from '{f.name}'. Skipping.")
-                            continue
-
-                        chunks = chunk_text(text, size=800, overlap=120)
-                        for chunk in chunks:
-                            docs.append((chunk, f.name))
-                    except Exception as e:
-                        st.error(f"Failed to process {f.name}: {e}")
-
-                if not docs:
-                    st.error(
-                        "No text could be extracted from the uploaded documents. Please check the files."
-                    )
-                else:
-                    embedder = load_sentence_transformer_model()
-                    retriever = SimpleFAISS(embedder)
+            with st.spinner("Processing documents..."):
+                docs = [
+                    (ch, f.name)
+                    for f in files
+                    if (text := load_text_from_filelike(f.name, f.read())).strip()
+                    for ch in chunk_text(text)
+                ]
+                if docs:
+                    retriever = HybridRetriever(load_sentence_transformer_model())
                     retriever.build(docs)
                     st.session_state.retriever = retriever
-                    st.success(
-                        f"✅ Index built successfully from {len(docs)} chunks across {len(files)} file(s)."
-                    )
+                    st.success(f"✅ Indexed {len(retriever.texts)} text chunks!")
+                else:
+                    st.error("Could not extract any text.")
 
-    st.divider()
-
-    # --- Main Interaction Area ---
-    st.header("3. Ask a Question")
-
-    if not st.session_state.retriever:
-        st.info(
-            "Please upload documents and build the index using the sidebar to get started."
-        )
-        return
-
-    # Initialize core components once index is ready
-    try:
-        asr = AssemblyAI_ASR()
-        tts = TTSWrapper()
-        generator = RAGGroq(model=st.session_state.llm_model, temperature=0.2)
-    except Exception as e:
-        st.error(f"Failed to initialize core components: {e}")
-        st.stop()
-
-    # Audio recorder widget
-    audio_bytes = audio_recorder(
-        text="Click the microphone to ask your question",
-        pause_threshold=2.0,
-        sample_rate=16_000,
-        icon_size="2x",
+    st.markdown("---")
+    st.header("2. Configure Settings")
+    top_k = st.slider("Context Chunks", 1, 15, 5)
+    llm_model = st.selectbox(
+        "Language Model", ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"]
     )
+    st.divider()
+    if st.button("Clear Chat History", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
 
-    if audio_bytes:
-        st.audio(audio_bytes, format="audio/wav")
+# ---------------------------
+# Main Chat UI
+# ---------------------------
+st.markdown(
+    '<h1 class="main-header">Enhanced AI Document Assistant</h1>',
+    unsafe_allow_html=True,
+)
 
+# --- Chat History Display (appears once there's history) ---
+if st.session_state.chat_history:
+    for message in st.session_state.chat_history:
+        if message["role"] == "user":
+            st.markdown(
+                f'<div class="user-bubble">{message["content"]}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div class="assistant-bubble">{message["content"]}</div>',
+                unsafe_allow_html=True,
+            )
+            if message.get("audio"):
+                st.audio(message["audio"], format="audio/wav")
+            if message.get("context"):
+                with st.expander("Show Sources"):
+                    for i, ctx in enumerate(message["context"]):
+                        st.info(f"Source {i + 1}: {ctx['source']}\n\n> {ctx['text']}")
+    st.markdown("---")
+
+
+# --- User Input ---
+text_query = st.text_input(
+    "Type your question...",
+    key="text_query",
+    disabled=st.session_state.processing,
+    label_visibility="collapsed",
+)
+
+audio_bytes = None
+# The custom class st-emotion-cache-1ypb00x is what audio_recorder creates for its button
+# We target it to apply our custom dark theme styling.
+if not st.session_state.processing:
+    audio_bytes = audio_recorder(
+        text="Click mic to ask...", icon_size="2x", key="voice_input"
+    )
+else:
+    st.button("🎤 Processing...", disabled=True, use_container_width=True)
+
+query = text_query if text_query else ("audio" if audio_bytes else None)
+
+# --- Processing Logic (Unchanged) ---
+if query and not st.session_state.processing:
+    if not st.session_state.retriever:
+        st.error("Please build a knowledge base first.")
+    else:
+        st.session_state.processing = True
+        query_text = ""
         try:
-            with st.spinner("1/4 - Transcribing your question..."):
-                query_text = asr.transcribe(audio_bytes)
-            st.info(f'❓ You asked: *"{query_text}"*')
-
-            if not query_text.strip():
-                st.warning("Could not detect any speech. Please try again.")
-                return
-
-            with st.spinner("2/4 - Searching for relevant context..."):
-                contexts = st.session_state.retriever.search(
-                    query_text, k=st.session_state.top_k
+            if query == "audio":
+                with st.spinner("🎤 Transcribing..."):
+                    services = Services(llm_model)
+                    query_text = services.transcribe_audio(audio_bytes)
+            else:
+                query_text = query
+            if query_text.strip():
+                st.session_state.chat_history.append(
+                    {"role": "user", "content": query_text}
                 )
-
-            with st.expander("🔎 View Retrieved Context"):
-                if not contexts:
-                    st.write("No relevant context found.")
-                for i, c in enumerate(contexts, 1):
-                    st.markdown(
-                        f"**{i}. Source: `{c['source']}`** (Score: {c['score']:.3f})"
-                    )
-                    st.markdown(f"> {c['text'][:500]}...")
-                    st.markdown("---")
-
-            with st.spinner("3/4 - Generating the answer..."):
-                answer = generator.generate(query_text, contexts)
-
-            with st.spinner("4/4 - Synthesizing the spoken answer..."):
-                # The synth function now returns the audio bytes AND the format string
-                out_audio_bytes, audio_format = tts.synth(answer)
-
-            st.markdown("### 🔊 Here is your answer:")
-            st.audio(out_audio_bytes, format=audio_format)
-
-            with st.expander("📝 View Text Answer"):
-                st.write(answer)
-
+                st.rerun()
         except Exception as e:
-            st.error(f"An error occurred during processing: {e}")
+            st.error(f"Input processing error: {e}")
+            st.session_state.processing = False
 
+if (
+    st.session_state.chat_history
+    and st.session_state.chat_history[-1]["role"] == "user"
+):
+    st.session_state.processing = True
+    last_user_message = st.session_state.chat_history[-1]["content"]
+    services = Services(llm_model)
+    retriever = st.session_state.retriever
 
-if __name__ == "__main__":
-    main()
+    with st.spinner("🔍 Searching documents..."):
+        context = retriever.search(last_user_message, k=top_k)
+
+    if not context:
+        st.warning("Could not find relevant information for your query.")
+        st.session_state.processing = False
+    else:
+        full_response = st.write_stream(
+            services.generate_streamed_response(
+                last_user_message, context, st.session_state.chat_history[:-1]
+            )
+        )
+
+        with st.spinner("🎧 Synthesizing audio..."):
+            audio_response = services.synthesize_audio(full_response)
+
+        st.session_state.chat_history.append(
+            {
+                "role": "assistant",
+                "content": full_response,
+                "audio": audio_response,
+                "context": context,
+            }
+        )
+        st.session_state.processing = False
+        st.rerun()

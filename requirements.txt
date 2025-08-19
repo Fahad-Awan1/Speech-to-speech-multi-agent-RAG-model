@@ -1,11 +1,15 @@
 streamlit
 audio-recorder-streamlit
+pydub
 requests
 faiss-cpu
+numpy
 sentence-transformers
 groq
 python-dotenv
 docx2txt
 pypdf
+TTS
 gTTS
-numpy==1.26.4
+rank_bm25
+python-pptx

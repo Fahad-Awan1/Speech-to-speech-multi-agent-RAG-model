@@ -42,15 +42,72 @@ The content is organized as follows:
 <directory_structure>
 .gitignore
 app.py
+check_key.py
 requirements.txt
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
 
+<file path="check_key.py">
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load the .env file to get the API key
+load_dotenv()
+
+print("Attempting to validate OpenAI API key...")
+
+api_key = os.getenv("OPENAI_API_KEY")
+
+if not api_key:
+    print("❌ Error: OPENAI_API_KEY not found in .env file.")
+else:
+    try:
+        # Initialize the client with the API key
+        client = OpenAI(api_key=api_key)
+
+        # Make a simple, low-cost API call to list models
+        client.models.list()
+
+        # If the call succeeds, the key is valid and the account is active
+        print("\n✅ Success! Your OpenAI API key is valid and active.")
+        print("You can now run your main application.")
+
+    except Exception as e:
+        # If the call fails, we can check the type of error
+        error_message = str(e)
+        if "Incorrect API key provided" in error_message:
+            print("\n❌ Error: Authentication failed. Your API key is incorrect or has been revoked.")
+            print("   Please double-check the key in your .env file.")
+        elif "You exceeded your current quota" in error_message:
+            print("\n❌ Error: Rate limit exceeded. This means you are out of free credits or your billing method has an issue.")
+            print("   Please check your usage and billing details on the OpenAI website: https://platform.openai.com/usage")
+        else:
+            # Catch any other potential errors (like network issues)
+            print(f"\n❌ An unexpected error occurred: {e}")
+</file>
+
 <file path=".gitignore">
 venv
 .env
+</file>
+
+<file path="requirements.txt">
+streamlit
+audio-recorder-streamlit
+pydub
+requests
+faiss-cpu
+numpy
+sentence-transformers
+groq
+python-dotenv
+docx2txt
+pypdf
+TTS
+gTTS
 </file>
 
 <file path="app.py">
@@ -59,46 +116,41 @@ import io
 import time
 import tempfile
 from pathlib import Path
+from TTS.api import TTS
+import torch, torchaudio, transformers, TTS
 
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
 from pydub import AudioSegment
 import requests
+
+# ----- Embeddings + Vector DB (FAISS) -----
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
+
+# ----- LLM (Groq) -----
 from groq import Groq
 from dotenv import load_dotenv
-import docx2txt
-from pypdf import PdfReader
 
-# ---------------------------
-# Load API Keys (env + secrets fallback)
-# ---------------------------
-load_dotenv()  # loads local .env if exists
+# Load .env file
+load_dotenv()
 
+# Get API keys
+api_key = os.getenv("ASSEMBLYAI_API_KEY")
+if not api_key:
+    raise RuntimeError("ASSEMBLYAI_API_KEY not set in .env file")
 
-def get_secret(key: str) -> str:
-    """Try .env first, then Streamlit secrets"""
-    return os.getenv(key) or st.secrets.get(key)
-
-
-ASSEMBLYAI_API_KEY = get_secret("ASSEMBLYAI_API_KEY")
-GROQ_API_KEY = get_secret("GROQ_API_KEY")
-
-if not ASSEMBLYAI_API_KEY:
-    raise RuntimeError("❌ ASSEMBLYAI_API_KEY not set (check .env or secrets.toml)")
-if not GROQ_API_KEY:
-    raise RuntimeError("❌ GROQ_API_KEY not set (check .env or secrets.toml)")
-
-# ---------------------------
-# TTS (choose one)
-# ---------------------------
+# ----- TTS (choose one) -----
 USE_COQUI = True
 if USE_COQUI:
     from TTS.api import TTS
 else:
     from gtts import gTTS
+
+# ----- Document loaders -----
+import docx2txt
+from pypdf import PdfReader
 
 
 # ---------------------------
@@ -181,11 +233,14 @@ class SimpleFAISS:
 # ---------------------------
 class AssemblyAI_ASR:
     def __init__(self):
-        self.api_key = ASSEMBLYAI_API_KEY
+        self.api_key = os.getenv("ASSEMBLYAI_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("ASSEMBLYAI_API_KEY not set")
         self.base_url = "https://api.assemblyai.com/v2"
         self.headers = {"authorization": self.api_key}
 
     def upload(self, wav_bytes: bytes) -> str:
+        """Upload audio bytes to AssemblyAI and return a temporary URL."""
         response = requests.post(
             f"{self.base_url}/upload", headers=self.headers, data=wav_bytes
         )
@@ -202,6 +257,7 @@ class AssemblyAI_ASR:
         transcript_id = response.json()["id"]
         polling_endpoint = f"{self.base_url}/transcript/{transcript_id}"
 
+        # Poll until complete
         while True:
             result = requests.get(polling_endpoint, headers=self.headers).json()
             if result["status"] == "completed":
@@ -216,7 +272,10 @@ class AssemblyAI_ASR:
 # ---------------------------
 class RAGGroq:
     def __init__(self, model="llama3-70b-8192", temperature=0.2):
-        self.client = Groq(api_key=GROQ_API_KEY)
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY not set")
+        self.client = Groq(api_key=api_key)
         self.model = model
         self.temperature = temperature
 
@@ -299,6 +358,8 @@ with st.sidebar:
 
 if "retriever" not in st.session_state:
     st.session_state.retriever = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 if build_btn:
     if not files:
@@ -333,56 +394,40 @@ if st.session_state.retriever:
     except Exception as e:
         st.error(f"Groq init error: {e}")
 
-audio_bytes = audio_recorder(
-    text="Click to record / stop", pause_threshold=2.0, sample_rate=16000
-)
+# Right-aligned mic button
+col1, col2 = st.columns([4, 1])
+with col2:
+    audio_bytes = audio_recorder(
+        text="🎤 Record", pause_threshold=2.0, sample_rate=16000
+    )
+
 if audio_bytes:
     st.audio(audio_bytes, format="audio/wav")
     with st.spinner("Transcribing (AssemblyAI)..."):
         query_text = asr.transcribe(audio_bytes)
     st.write(f"🗒️ *Heard:* `{query_text}`")
 
-    if not query_text.strip():
-        st.error("Didn't catch that. Try again.")
-    elif not st.session_state.retriever:
-        st.warning("Build the index first from the sidebar.")
-    elif not generator:
-        st.warning("LLM not ready. Check GROQ_API_KEY and try again.")
-    else:
-        with st.spinner("Retrieving..."):
-            ctx = st.session_state.retriever.search(query_text, k=top_k)
-        with st.expander("🔎 Retrieved context"):
-            for i, c in enumerate(ctx, 1):
-                st.markdown(
-                    f"**{i}. {c['source']}** (score={c['score']:.3f})\n\n{c['text'][:600]}{'...' if len(c['text']) > 600 else ''}"
-                )
+    if st.session_state.retriever and generator and query_text.strip():
+        ctx = st.session_state.retriever.search(query_text, k=top_k)
+        answer = generator.generate(query_text, ctx)
+        out_wav = tts.synth(answer)
 
-        with st.spinner("Generating answer..."):
-            answer = generator.generate(query_text, ctx)
-
-        with st.spinner("Synthesizing speech..."):
-            out_wav = tts.synth(answer)
+        # Save to history
+        st.session_state.chat_history.append(
+            {"query": query_text, "answer": answer, "audio": out_wav}
+        )
 
         st.markdown("### ▶️ Answer (audio)")
         st.audio(out_wav, format="audio/wav")
-        with st.expander("📝 (Dev view) Text answer"):
-            st.write(answer)
-</file>
 
-<file path="requirements.txt">
-streamlit
-audio-recorder-streamlit
-pydub
-requests
-faiss-cpu
-numpy
-sentence-transformers
-groq
-python-dotenv
-docx2txt
-pypdf
-TTS
-gTTS
+# Show history
+if st.session_state.chat_history:
+    st.subheader("💬 Chat History")
+    for i, chat in enumerate(st.session_state.chat_history, 1):
+        with st.container():
+            st.markdown(f"**🧑 Q{i}:** {chat['query']}")
+            st.markdown(f"**🤖 A{i}:** {chat['answer']}")
+            st.audio(chat["audio"], format="audio/wav")
 </file>
 
 </files>
