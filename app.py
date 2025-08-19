@@ -15,14 +15,13 @@ from groq import Groq
 from dotenv import load_dotenv
 import docx2txt
 from pypdf import PdfReader
+from gtts import gTTS
 
 # --- Configuration ---
-# Use gTTS for Text-to-Speech as it's lightweight and better for deployment.
-# Coqui TTS is powerful but requires heavy dependencies (PyTorch) which can
-# exceed memory limits on free hosting platforms like Streamlit Community Cloud.
-USE_COQUI_TTS = False
+# This version is optimized for gTTS for stability and easy deployment.
+# The code for Coqui TTS has been removed for simplicity.
 
-# Set up basic logging
+# Set up basic logging to show information in the terminal
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -48,15 +47,19 @@ def get_secret(key: str) -> str:
 
     # Fallback to Streamlit secrets if not found in env
     try:
-        return st.secrets.get(key)
+        # st.secrets is only available when the app is running on Streamlit,
+        # so we handle the case where it might not be available locally.
+        if hasattr(st, "secrets"):
+            return st.secrets.get(key)
     except Exception:
         return None
+    return None
 
 
 ASSEMBLYAI_API_KEY = get_secret("ASSEMBLYAI_API_KEY")
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
 
-# Check for essential API keys and stop if not found
+# Check for essential API keys and stop the app if they are not found
 if not ASSEMBLYAI_API_KEY:
     st.error(
         "❌ ASSEMBLYAI_API_KEY not found. Please set it in your .env file or Streamlit secrets."
@@ -69,19 +72,6 @@ if not GROQ_API_KEY:
     st.stop()
 
 
-# Conditionally import TTS libraries based on configuration
-if USE_COQUI_TTS:
-    try:
-        from TTS.api import TTS
-    except ImportError:
-        st.error(
-            "Coqui TTS library not found. Please install it with 'pip install TTS'."
-        )
-        st.stop()
-else:
-    from gtts import gTTS
-
-
 # ---------------------------
 # Caching for Expensive Models
 # ---------------------------
@@ -89,19 +79,9 @@ else:
 def load_sentence_transformer_model(
     model_name="sentence-transformers/all-MiniLM-L6-v2",
 ):
-    """Loads and caches the SentenceTransformer model."""
+    """Loads and caches the SentenceTransformer model to avoid reloading on every run."""
     logging.info(f"Loading SentenceTransformer model: {model_name}")
     return SentenceTransformer(model_name)
-
-
-@st.cache_resource
-def load_tts_model():
-    """Loads and caches the TTS model if Coqui is used."""
-    if USE_COQUI_TTS:
-        logging.info("Loading Coqui TTS model...")
-        # Note: This will download the model on the first run, which can take time.
-        return TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC")
-    return None
 
 
 # ---------------------------
@@ -141,7 +121,7 @@ def load_text_from_filelike(filename: str, data: bytes) -> str:
 
 def chunk_text(text: str, size: int = 800, overlap: int = 120) -> list[str]:
     """
-    Splits a long text into smaller chunks with a specified overlap.
+    Splits a long text into smaller, overlapping chunks.
     """
     if not text:
         return []
@@ -303,37 +283,26 @@ Answer:"""
             raise RuntimeError(f"Failed to generate answer from LLM: {e}")
 
 
-# --- THIS IS THE NEW, SIMPLIFIED CODE ---
 class TTSWrapper:
-    """A wrapper for Text-to-Speech synthesis."""
+    """A simplified wrapper for Text-to-Speech synthesis using gTTS."""
 
-    def __init__(self):
-        self.tts_model = load_tts_model() if USE_COQUI_TTS else None
-
-    def synth(self, text: str) -> tuple[bytes, str]:  # We will return the format too
-        """Synthesizes text into speech."""
-        logging.info(f"Synthesizing speech for text: '{text[:50]}...'")
-        if USE_COQUI_TTS:
-            tmp_path = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                    tmp_path = tmp.name
-                self.tts_model.tts_to_file(text=text, file_path=tmp_path)
-                with open(tmp_path, "rb") as f:
-                    return f.read(), "audio/wav"  # Return WAV bytes and format
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-        else:  # Use gTTS
-            try:
-                tts_obj = gTTS(text=text, lang="en")
-                mp3_fp = io.BytesIO()
-                tts_obj.write_to_fp(mp3_fp)
-                mp3_fp.seek(0)
-                return mp3_fp.getvalue(), "audio/mp3"  # Return MP3 bytes and format
-            except Exception as e:
-                logging.error(f"gTTS failed: {e}")
-                raise RuntimeError(f"Failed to synthesize speech: {e}")
+    def synth(self, text: str) -> tuple[bytes, str]:
+        """
+        Synthesizes text into speech (MP3 format) using gTTS.
+        Returns a tuple of (audio_bytes, audio_format_string).
+        """
+        logging.info(f"Synthesizing speech with gTTS for text: '{text[:50]}...'")
+        try:
+            tts_obj = gTTS(text=text, lang="en")
+            # Create an in-memory binary stream to save the MP3 file
+            mp3_fp = io.BytesIO()
+            tts_obj.write_to_fp(mp3_fp)
+            mp3_fp.seek(0)
+            # Return the MP3 bytes and the correct format string for st.audio
+            return mp3_fp.getvalue(), "audio/mp3"
+        except Exception as e:
+            logging.error(f"gTTS failed: {e}")
+            raise RuntimeError(f"Failed to synthesize speech: {e}")
 
 
 # ---------------------------
@@ -359,13 +328,17 @@ def main():
 
         build_btn = st.button("Build Index")
 
-    st.slider("Number of context chunks to retrieve", 1, 10, 5, key="top_k")
-    st.selectbox(
-        "Groq LLM Model",
-        ["llama3-70b-8192", "mixtral-8x7b-32768", "llama3-8b-8192"],
-        index=0,
-        key="llm_model",
-    )
+        st.divider()
+        st.header("2. Configure Settings")
+        # Use st.session_state to access these values later
+        st.slider("Number of context chunks to retrieve", 1, 10, 5, key="top_k")
+        st.selectbox(
+            "Groq LLM Model",
+            ["llama3-70b-8192", "mixtral-8x7b-32768", "llama3-8b-8192"],
+            index=0,
+            key="llm_model",
+        )
+
     # --- Session State Initialization ---
     if "retriever" not in st.session_state:
         st.session_state.retriever = None
@@ -464,13 +437,13 @@ def main():
             with st.spinner("3/4 - Generating the answer..."):
                 answer = generator.generate(query_text, contexts)
 
-            # --- THIS IS THE NEW CODE ---
             with st.spinner("4/4 - Synthesizing the spoken answer..."):
-                # The synth function now returns the audio bytes AND the format
+                # The synth function now returns the audio bytes AND the format string
                 out_audio_bytes, audio_format = tts.synth(answer)
 
             st.markdown("### 🔊 Here is your answer:")
             st.audio(out_audio_bytes, format=audio_format)
+
             with st.expander("📝 View Text Answer"):
                 st.write(answer)
 
