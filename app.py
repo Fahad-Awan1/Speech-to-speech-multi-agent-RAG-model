@@ -77,12 +77,10 @@ def load_tts_model():
 # ---------------------------
 # Enhanced Backend Functionality (Unchanged)
 # ---------------------------
-# All backend classes (load_text_from_filelike, chunk_text, HybridRetriever, Services)
-# remain exactly the same as the previous correct version. They are omitted here for brevity
-# but are included in the full script below.
 
 
 def load_text_from_filelike(filename: str, data: bytes) -> str:
+    # This function remains the same as the previous version
     suffix = Path(filename).suffix.lower()
     text = ""
     try:
@@ -110,6 +108,7 @@ def load_text_from_filelike(filename: str, data: bytes) -> str:
 
 
 def chunk_text(text: str, size=1000, overlap=150):
+    # This function remains the same
     chunks = []
     start = 0
     while start < len(text):
@@ -122,6 +121,7 @@ def chunk_text(text: str, size=1000, overlap=150):
 
 
 class HybridRetriever:
+    # This class remains the same
     def __init__(self, model):
         self.embedder = model
         self.texts = []
@@ -167,6 +167,7 @@ class HybridRetriever:
 
 
 class Services:
+    # This class remains the same
     def __init__(self, model_name):
         self.groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
         self.model_name = model_name
@@ -245,11 +246,12 @@ class Services:
 # Streamlit UI
 # ---------------------------
 
+# --- NEW CSS FOR THE DARK THEME ---
 st.markdown(
     """
 <style>
     /* General App Styling */
-    .stApp { background-color: #F0F2F6; }
+    .stApp { background-color: #0F1115; color: #E5E7EB; }
     #MainMenu, footer, header { visibility: hidden; }
     .block-container { padding: 1rem 2rem 2rem 2rem !important; }
 
@@ -266,7 +268,7 @@ st.markdown(
 
     /* Sidebar Styling */
     [data-testid="stSidebar"] {
-        background-color: #25262A;
+        background-color: #1F2125;
         padding: 1rem;
     }
     [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2 {
@@ -276,10 +278,21 @@ st.markdown(
     [data-testid="stSidebar"] p {
         color: #A0A0A0;
     }
-    [data-testid="stSidebar"] .stButton > button {
-        background-color: #3C3F44;
+    .stButton > button {
+        background-color: #30333A;
         color: #FFFFFF;
-        border: 1px solid #555;
+        border: 1px solid #4A4D55;
+        border-radius: 8px;
+        padding: 10px 14px;
+    }
+    .stButton > button:hover {
+        background-color: #3C3F44;
+        border-color: #5A5F69;
+    }
+    [data-testid="stSidebar"] .stButton > button {
+        background-color: #30333A;
+        color: #FFFFFF;
+        border: 1px solid #4A4D55;
         border-radius: 8px;
         padding: 10px 0;
     }
@@ -324,15 +337,18 @@ st.markdown(
     }
 
     /* Chat Bubbles (Simple styling for when chat history appears) */
-    .user-bubble { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 1rem; border-radius: 10px 10px 0 10px; margin-bottom: 1rem; }
-    .assistant-bubble { background-color: #FFFFFF; color: #333; padding: 1rem; border-radius: 10px 10px 10px 0; border: 1px solid #E0E0E0; margin-bottom: 0.5rem;}
+    .user-bubble { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 1rem; border-radius: 10px 10px 0 10px; }
+    .assistant-bubble { background-color: #2B2D31; color: #E5E7EB; padding: 1rem; border-radius: 10px 10px 10px 0; border: 1px solid #3C3F44; }
+
 </style>
 """,
     unsafe_allow_html=True,
 )
 
+# Add the gradient bar to the top of the page
 st.markdown('<div class="top-gradient-bar"></div>', unsafe_allow_html=True)
 
+# --- Session State ---
 if "retriever" not in st.session_state:
     st.session_state.retriever = None
 if "chat_history" not in st.session_state:
@@ -340,6 +356,9 @@ if "chat_history" not in st.session_state:
 if "processing" not in st.session_state:
     st.session_state.processing = False
 
+# ---------------------------
+# Sidebar UI
+# ---------------------------
 with st.sidebar:
     st.title("🚀 AI Assistant")
     st.markdown("---")
@@ -381,11 +400,15 @@ with st.sidebar:
         st.session_state.chat_history = []
         st.rerun()
 
+# ---------------------------
+# Main Chat UI
+# ---------------------------
 st.markdown(
     '<h1 class="main-header">Enhanced AI Document Assistant</h1>',
     unsafe_allow_html=True,
 )
 
+# --- Chat History Display (appears once there's history) ---
 if st.session_state.chat_history:
     for message in st.session_state.chat_history:
         if message["role"] == "user":
@@ -406,6 +429,8 @@ if st.session_state.chat_history:
                         st.info(f"Source {i + 1}: {ctx['source']}\n\n> {ctx['text']}")
     st.markdown("---")
 
+
+# --- User Input ---
 text_query = st.text_input(
     "Type your question...",
     key="text_query",
@@ -414,6 +439,8 @@ text_query = st.text_input(
 )
 
 audio_bytes = None
+# The custom class st-emotion-cache-1ypb00x is what audio_recorder creates for its button
+# We target it to apply our custom dark theme styling.
 if not st.session_state.processing:
     audio_bytes = audio_recorder(
         text="Click mic to ask...", icon_size="2x", key="voice_input"
@@ -423,6 +450,7 @@ else:
 
 query = text_query if text_query else ("audio" if audio_bytes else None)
 
+# --- Processing Logic  ---
 if query and not st.session_state.processing:
     if not st.session_state.retriever:
         st.error("Please build a knowledge base first.")
@@ -461,18 +489,13 @@ if (
         st.warning("Could not find relevant information for your query.")
         st.session_state.processing = False
     else:
-        # --- THIS IS THE CORRECTED BLOCK ---
         with st.chat_message("assistant", avatar="🚀"):
-            full_response = st.write_stream(
-                services.generate_streamed_response(
-                    last_user_message, context, st.session_state.chat_history[:-1]
-                )
-            )
+            # 2. Call write_stream INSIDE the container. It will render the stream here.
+            full_response = st.write_stream(services.generate_streamed_response(...))
 
         with st.spinner("🎧 Synthesizing audio..."):
             audio_response = services.synthesize_audio(full_response)
 
-        # We add to chat_history *after* the stream is complete
         st.session_state.chat_history.append(
             {
                 "role": "assistant",

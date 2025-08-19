@@ -13,3 +13,4 @@ TTS
 gTTS
 rank_bm25
 python-pptx
+streamlit>=1.32.0
