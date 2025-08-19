@@ -450,7 +450,7 @@ else:
 
 query = text_query if text_query else ("audio" if audio_bytes else None)
 
-# --- Processing Logic (Unchanged) ---
+# --- Processing Logic  ---
 if query and not st.session_state.processing:
     if not st.session_state.retriever:
         st.error("Please build a knowledge base first.")
