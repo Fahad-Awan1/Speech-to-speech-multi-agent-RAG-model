@@ -491,7 +491,11 @@ if (
     else:
         with st.chat_message("assistant", avatar="🚀"):
             # 2. Call write_stream INSIDE the container. It will render the stream here.
-            full_response = st.write_stream(services.generate_streamed_response(...))
+            full_response = st.write_stream(
+                services.generate_streamed_response(
+                    last_user_message, context, st.session_state.chat_history[:-1]
+                )
+            )
 
         with st.spinner("🎧 Synthesizing audio..."):
             audio_response = services.synthesize_audio(full_response)
